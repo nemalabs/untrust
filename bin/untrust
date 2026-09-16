@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG="${CLAUDE_CONFIG:-$HOME/.claude.json}"
+BACKUP_DIR="${UNTRUST_BACKUP_DIR:-$HOME/.claude/untrust-backups}"
+BACKUP_KEEP="${UNTRUST_BACKUP_KEEP:-10}"
+
+usage() {
+  cat <<'EOF'
+untrust - drop a project entry from Claude Code's ~/.claude.json
+
+Usage:
+  untrust [-n] [PATH]
+
+Arguments:
+  PATH             target project path (default: current directory)
+
+Options:
+  -n, --dry-run    report the matched entry without modifying anything
+  -h, --help       show this help
+
+The key is matched against .projects by exact string. A timestamped backup
+of the whole config is written before the entry is removed.
+
+Environment:
+  CLAUDE_CONFIG        config path       (default: ~/.claude.json)
+  UNTRUST_BACKUP_DIR   backup directory  (default: ~/.claude/untrust-backups)
+  UNTRUST_BACKUP_KEEP  backups to keep   (default: 10, 0 disables pruning)
+EOF
+}
+
+die() {
+  printf 'untrust: %s\n' "$1" >&2
+  exit 1
+}
+
+abspath() {
+  local p="$1"
+  case "$p" in
+    /*) ;;
+    *) p="$PWD/$p" ;;
+  esac
+  while [ "$p" != "/" ] && [ "${p%/}" != "$p" ]; do
+    p="${p%/}"
+  done
+  printf '%s' "$p"
+}
+
+has_key() {
+  jq -e --arg k "$1" '(.projects // {}) | has($k)' "$CONFIG" >/dev/null 2>&1
+}
+
+dry_run=0
+target=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n | --dry-run) dry_run=1 ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*) die "unknown option: $1" ;;
+    *)
+      if [ -n "$target" ]; then die "too many arguments"; fi
+      target="$1"
+      ;;
+  esac
+  shift
+done
+if [ $# -gt 0 ]; then target="$1"; fi
+
+case "$BACKUP_KEEP" in
+  '' | *[!0-9]*) die "UNTRUST_BACKUP_KEEP must be a non-negative integer: $BACKUP_KEEP" ;;
+esac
+
+command -v jq >/dev/null 2>&1 || die "jq is required but not installed"
+[ -f "$CONFIG" ] || die "config not found: $CONFIG"
+jq -e . "$CONFIG" >/dev/null 2>&1 || die "config is not valid JSON: $CONFIG"
+
+key="$(abspath "${target:-$PWD}")"
+if ! has_key "$key"; then
+  # A shell can sit in a symlinked cwd while the config holds the resolved path.
+  phys="$( (cd "$key" 2>/dev/null && pwd -P) || true)"
+  if [ -n "$phys" ] && [ "$phys" != "$key" ] && has_key "$phys"; then
+    key="$phys"
+  else
+    die "no project entry matches: $key"
+  fi
+fi
+
+if [ "$dry_run" -eq 1 ]; then
+  printf 'untrust: would remove %s\n' "$key"
+  exit 0
+fi
+
+mkdir -p "$BACKUP_DIR"
+backup="$BACKUP_DIR/claude.json.$(date +%Y%m%d-%H%M%S).$$"
+cp -p "$CONFIG" "$backup"
+
+tmp="$CONFIG.untrust.$$"
+trap 'rm -f "$tmp"' EXIT
+jq --arg k "$key" 'del(.projects[$k])' "$CONFIG" >"$tmp"
+jq -e --arg k "$key" '(.projects // {}) | has($k) | not' "$tmp" >/dev/null ||
+  die "entry survived the rewrite, config left untouched: $key"
+chmod "$(stat -f '%OLp' "$CONFIG" 2>/dev/null || stat -c '%a' "$CONFIG" 2>/dev/null || echo 600)" "$tmp"
+mv -f "$tmp" "$CONFIG"
+trap - EXIT
+
+if [ "$BACKUP_KEEP" -gt 0 ]; then
+  # Sort by the timestamp in the name, not by mtime: cp -p stamps each backup
+  # with the config's own mtime, so mtime order is not creation order.
+  (ls -1 "$BACKUP_DIR"/claude.json.* 2>/dev/null || true) |
+    sort -r |
+    tail -n "+$((BACKUP_KEEP + 1))" |
+    while IFS= read -r old; do rm -f "$old"; done
+fi
+
+printf 'untrust: removed %s\n' "$key"
+printf 'untrust: backup at %s\n' "$backup"
+printf 'untrust: a running Claude Code session may write the entry back on exit\n' >&2
